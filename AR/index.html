@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Maquette AR Overlay</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    height: 100%;
+    background: #0b0b0b;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #f2f2f2;
+  }
+  #intro {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 32px;
+    box-sizing: border-box;
+  }
+  #intro h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  #intro p {
+    max-width: 480px;
+    line-height: 1.5;
+    color: #b8b8b8;
+    font-size: 15px;
+  }
+  #intro .controls {
+    text-align: left;
+    max-width: 480px;
+    margin-top: 20px;
+    background: #1a1a1a;
+    border-radius: 12px;
+    padding: 16px 20px;
+    font-size: 14px;
+    line-height: 1.7;
+  }
+  #intro .controls b { color: #fff; }
+  #status {
+    margin-top: 16px;
+    font-size: 13px;
+    color: #7a7a7a;
+    min-height: 18px;
+  }
+  #hud {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    background: rgba(0,0,0,0.55);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 13px;
+    line-height: 1.6;
+    display: none;
+    pointer-events: none;
+  }
+  button#ar-button {
+    background: #f2f2f2 !important;
+    color: #0b0b0b !important;
+    border: none !important;
+    border-radius: 999px !important;
+    padding: 14px 28px !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    margin-top: 24px !important;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+
+<div id="intro">
+  <h1>Maquette AR Overlay</h1>
+  <p>Loads your scan as a semi-transparent ghost in passthrough AR so you can compare it live against the physical maquette.</p>
+  <div class="controls">
+    <div><b>Right trigger (hold):</b> drag the model to follow your controller</div>
+    <div><b>Right thumbstick (left/right):</b> rotate the model</div>
+    <div><b>Left thumbstick (up/down):</b> scale the model</div>
+    <div><b>A button:</b> cycle look — translucent / wireframe / solid</div>
+    <div><b>B button:</b> reset position in front of you</div>
+  </div>
+  <div id="status">Loading model…</div>
+</div>
+
+<div id="hud"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+const MODEL_URL = 'https://raw.githubusercontent.com/perfectionisht/Frog-Models/main/Prototype3_web.glb';
+const INITIAL_LONGEST_DIM_M = 0.20; // starting size: 20cm along the model's longest axis, adjust with left stick
+
+const statusEl = document.getElementById('status');
+const hudEl = document.getElementById('hud');
+
+let renderer, scene, camera;
+let modelRoot = null;          // group we transform (position/rotation/scale)
+let originalMaterials = [];    // [{mesh, material}] to restore/rebuild from
+let displayMode = 0;           // 0 = translucent, 1 = wireframe, 2 = solid
+const modes = ['translucent', 'wireframe', 'solid'];
+
+let scaleFactor = 1;           // multiplier on top of the initial normalized scale
+let baseScale = 1;             // computed once model loads, so longest dim = INITIAL_LONGEST_DIM_M
+
+let dragging = false;
+let dragController = null;
+
+init();
+
+function init() {
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  renderer.setClearColor(0x000000, 0);
+  document.body.appendChild(renderer.domElement);
+
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(1, 2, 1);
+  scene.add(dir);
+
+  const arButton = ARButton.createButton(renderer, {
+    requiredFeatures: [],
+    optionalFeatures: ['local-floor', 'bounded-floor', 'dom-overlay'],
+    domOverlay: { root: document.body }
+  });
+  document.body.appendChild(arButton);
+
+  window.addEventListener('resize', onResize);
+
+  setupControllers();
+  loadModel();
+
+  renderer.setAnimationLoop(render);
+
+  renderer.xr.addEventListener('sessionstart', () => {
+    hudEl.style.display = 'block';
+    document.getElementById('intro').style.display = 'none';
+    resetPosition();
+  });
+  renderer.xr.addEventListener('sessionend', () => {
+    hudEl.style.display = 'none';
+    document.getElementById('intro').style.display = 'flex';
+  });
+}
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function loadModel() {
+  const loader = new GLTFLoader();
+  loader.load(
+    MODEL_URL,
+    (gltf) => {
+      modelRoot = new THREE.Group();
+      const inner = gltf.scene;
+      modelRoot.add(inner);
+      scene.add(modelRoot);
+
+      // Center the model on its own bounding box and normalize starting scale
+      const box = new THREE.Box3().setFromObject(inner);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+      inner.position.sub(center); // center at origin of the group
+
+      const longest = Math.max(size.x, size.y, size.z) || 1;
+      baseScale = INITIAL_LONGEST_DIM_M / longest;
+
+      inner.traverse((obj) => {
+        if (obj.isMesh) {
+          originalMaterials.push({ mesh: obj, material: obj.material });
+        }
+      });
+
+      applyDisplayMode();
+      updateModelTransform();
+      resetPosition();
+
+      statusEl.textContent = 'Model loaded. Tap "Enter AR" to begin.';
+    },
+    (xhr) => {
+      if (xhr.total) {
+        const pct = Math.round((xhr.loaded / xhr.total) * 100);
+        statusEl.textContent = `Loading model… ${pct}%`;
+      }
+    },
+    (err) => {
+      console.error(err);
+      statusEl.textContent = 'Failed to load model. Check the console / your connection.';
+    }
+  );
+}
+
+function applyDisplayMode() {
+  const mode = modes[displayMode];
+  originalMaterials.forEach(({ mesh, material }) => {
+    let mat;
+    if (mode === 'wireframe') {
+      mat = new THREE.MeshBasicMaterial({
+        color: 0x53ffcf,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false
+      });
+    } else if (mode === 'solid') {
+      mat = material.clone();
+      mat.transparent = false;
+      mat.opacity = 1;
+    } else {
+      // translucent
+      mat = material.clone();
+      mat.transparent = true;
+      mat.opacity = 0.35;
+      mat.depthWrite = false;
+      mat.side = THREE.DoubleSide;
+    }
+    mesh.material = mat;
+  });
+  updateHud();
+}
+
+function updateModelTransform() {
+  if (!modelRoot) return;
+  const s = baseScale * scaleFactor;
+  modelRoot.scale.setScalar(s);
+  updateHud();
+}
+
+function updateHud() {
+  if (!modelRoot) return;
+  const s = baseScale * scaleFactor;
+  hudEl.textContent = `look: ${modes[displayMode]}  |  scale: ${(s).toFixed(3)}x  |  rot: ${(THREE.MathUtils.radToDeg(modelRoot.rotation.y) % 360).toFixed(0)}°`;
+}
+
+function resetPosition() {
+  if (!modelRoot) return;
+  const camPos = new THREE.Vector3();
+  const camDir = new THREE.Vector3();
+  camera.getWorldPosition(camPos);
+  camera.getWorldDirection(camDir);
+  modelRoot.position.copy(camPos).add(camDir.multiplyScalar(0.6));
+  modelRoot.position.y -= 0.15;
+}
+
+// ---- Controllers ----
+let controller0, controller1; // 0 = right (typically), 1 = left, but we detect by handedness
+const controllers = [];
+
+function setupControllers() {
+  for (let i = 0; i < 2; i++) {
+    const controller = renderer.xr.getController(i);
+    controller.userData.index = i;
+    scene.add(controller);
+    controllers.push(controller);
+
+    controller.addEventListener('selectstart', onSelectStart);
+    controller.addEventListener('selectend', onSelectEnd);
+
+    const geo = new THREE.ConeGeometry(0.01, 0.03, 8);
+    geo.rotateX(Math.PI / 2);
+    const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const tip = new THREE.Mesh(geo, mat);
+    controller.add(tip);
+  }
+}
+
+function onSelectStart(event) {
+  dragging = true;
+  dragController = event.target;
+}
+function onSelectEnd() {
+  dragging = false;
+  dragController = null;
+}
+
+function handleGamepads() {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+
+  for (const source of session.inputSources) {
+    if (!source.gamepad || !source.handedness) continue;
+    const gp = source.gamepad;
+    const axes = gp.axes; // [x, y] or [touchX, touchY, thumbX, thumbY] depending on mapping
+    const thumbX = axes.length >= 4 ? axes[2] : axes[0];
+    const thumbY = axes.length >= 4 ? axes[3] : axes[1];
+
+    if (source.handedness === 'right') {
+      // rotate with X axis of right thumbstick
+      if (Math.abs(thumbX) > 0.2 && modelRoot) {
+        modelRoot.rotation.y -= thumbX * 0.03;
+        updateHud();
+      }
+      // A button = buttons[4] on Touch controllers typically, but check by label fallback
+      const aPressed = gp.buttons[4] && gp.buttons[4].pressed;
+      if (aPressed && !source._aWasPressed) {
+        displayMode = (displayMode + 1) % modes.length;
+        applyDisplayMode();
+      }
+      source._aWasPressed = aPressed;
+
+      const bPressed = gp.buttons[5] && gp.buttons[5].pressed;
+      if (bPressed && !source._bWasPressed) {
+        resetPosition();
+      }
+      source._bWasPressed = bPressed;
+    }
+
+    if (source.handedness === 'left') {
+      // scale with Y axis of left thumbstick
+      if (Math.abs(thumbY) > 0.2) {
+        scaleFactor *= (1 - thumbY * 0.02);
+        scaleFactor = THREE.MathUtils.clamp(scaleFactor, 0.05, 20);
+        updateModelTransform();
+      }
+    }
+  }
+}
+
+function render() {
+  handleGamepads();
+
+  if (dragging && dragController && modelRoot) {
+    const pos = new THREE.Vector3();
+    dragController.getWorldPosition(pos);
+    modelRoot.position.copy(pos);
+  }
+
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
